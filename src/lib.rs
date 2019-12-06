@@ -4,4 +4,4 @@
 
 pub mod fs;
 pub mod gist;
-pub mod inode;
+pub mod node;
