@@ -1,53 +1,103 @@
 use crate::{
     gist::GistClient,
-    node::{Node, NodeFS, ROOT_INO},
+    node::{Node, NodeTable},
 };
-use crossbeam::atomic::AtomicCell;
-use futures::io::AsyncWrite;
-use polyfuse::{Context, FileAttr, Filesystem, Operation};
-use std::io;
+use futures::{io::AsyncWrite, lock::Mutex};
+use polyfuse::{
+    op,
+    reply::{ReplyAttr, ReplyEntry},
+    Context, FileAttr, Filesystem, Operation,
+};
+use std::{collections::HashMap, io, sync::Arc};
 
 pub struct GistFs {
-    nodes: NodeFS,
     client: GistClient,
+    node_table: NodeTable,
+    files: Mutex<HashMap<u64, Arc<GistFileNode>>>,
 }
 
 impl GistFs {
     pub fn new(client: GistClient) -> Self {
+        let root_attr = {
+            let mut attr = FileAttr::default();
+            attr.set_mode(libc::S_IFDIR | 0o555);
+            attr.set_uid(unsafe { libc::getuid() });
+            attr.set_gid(unsafe { libc::getgid() });
+            attr.set_nlink(2);
+            attr
+        };
+
+        let node_table = NodeTable::new(root_attr);
+
         Self {
-            nodes: NodeFS::new(RootNode::new()),
             client,
+            node_table,
+            files: Mutex::default(),
         }
     }
 
     // TODO:
     // * invalidate the old files
-    // * update directory entries
     pub async fn fetch_gist(&self) -> anyhow::Result<()> {
+        tracing::debug!("fetch the gist content");
         let gist = self.client.fetch().await?;
-        for (filename, file) in gist.files {
-            self.nodes
-                .insert(
-                    ROOT_INO,
-                    filename.into(),
-                    GistFileNode {
-                        attr: {
-                            let mut attr = FileAttr::default();
-                            attr.set_nlink(1);
-                            attr.set_mode(libc::S_IFREG | 0o444);
-                            attr.set_size(file.size as u64);
-                            attr.set_uid(unsafe { libc::getuid() });
-                            attr.set_gid(unsafe { libc::getuid() });
-                            AtomicCell::new(attr)
-                        },
-                        content: file.content.into(),
-                    },
-                )
-                .await
-                .map_err(std::io::Error::from_raw_os_error)?;
+
+        let old_files = {
+            let mut files = self.files.lock().await;
+
+            let mut new_files = HashMap::with_capacity(files.len());
+            for (filename, gist_file) in gist.files {
+                let ino = files
+                    .iter()
+                    .find(|(_, file)| file.filename == filename)
+                    .map(|(ino, _)| *ino);
+                match ino {
+                    Some(ino) => {
+                        tracing::debug!("update an exist file: filename={:?}", gist_file.filename);
+                        let file = files.remove(&ino).unwrap();
+                        file.update_content(gist_file.size, gist_file.content).await;
+                        new_files.insert(ino, file);
+                    }
+                    None => {
+                        tracing::debug!("new file: filename={:?}", gist_file.filename);
+                        let mut attr = FileAttr::default();
+                        attr.set_nlink(1);
+                        attr.set_mode(libc::S_IFREG | 0o444);
+                        attr.set_size(gist_file.size as u64);
+                        attr.set_uid(unsafe { libc::getuid() });
+                        attr.set_gid(unsafe { libc::getgid() });
+
+                        let node = self
+                            .node_table
+                            .new_node(1, filename.clone().into(), attr)
+                            .await
+                            .map_err(std::io::Error::from_raw_os_error)?;
+
+                        new_files.insert(
+                            node.attr().ino(),
+                            Arc::new(GistFileNode {
+                                node,
+                                filename,
+                                content: Mutex::new(gist_file.content.into()),
+                            }),
+                        );
+                    }
+                }
+            }
+            std::mem::replace(&mut *files, new_files)
+        };
+
+        for (ino, file) in old_files {
+            tracing::debug!("remove a file: ino={}, filename={:?}", ino, file.filename);
+            self.node_table.remove_node(ino).await;
         }
 
         Ok(())
+    }
+
+    async fn get_file(&self, ino: u64) -> Option<Arc<GistFileNode>> {
+        let files = self.files.lock().await;
+        files.get(&ino).cloned()
     }
 }
 
@@ -58,69 +108,75 @@ impl<T> Filesystem<T> for GistFs {
         T: Send + 'async_trait,
         W: AsyncWrite + Unpin + Send,
     {
-        self.nodes.reply(cx, op).await
-    }
-}
-
-// ==== RootNode ====
-
-struct RootNode {
-    attr: AtomicCell<FileAttr>,
-}
-
-impl RootNode {
-    fn new() -> Self {
-        Self {
-            attr: {
-                let mut attr = FileAttr::default();
-                attr.set_ino(ROOT_INO);
-                attr.set_mode(libc::S_IFDIR | 0o555);
-                attr.set_uid(unsafe { libc::getuid() });
-                attr.set_gid(unsafe { libc::getgid() });
-                attr.set_nlink(2);
-                AtomicCell::new(attr)
+        match op {
+            Operation::Lookup(op) => match self.node_table.lookup(op.parent(), op.name()).await {
+                Some(node) => {
+                    let mut reply = ReplyEntry::new(node.attr());
+                    reply.entry_valid(0, 0);
+                    reply.attr_valid(0, 0);
+                    op.reply(cx, reply).await?
+                }
+                None => cx.reply_err(libc::ENOENT).await?,
             },
+
+            Operation::Forget(forgets) => self.node_table.forget(forgets).await,
+
+            Operation::Getattr(op) => match self.node_table.get_node(op.ino()).await {
+                Some(node) => {
+                    let mut reply = ReplyAttr::new(node.attr());
+                    reply.attr_valid(0, 0);
+                    op.reply(cx, reply).await?
+                }
+                None => cx.reply_err(libc::ENOENT).await?,
+            },
+
+            Operation::Readdir(op) => self.node_table.reply_readdir(cx, op).await?,
+
+            Operation::Read(op) => match self.get_file(op.ino()).await {
+                Some(file) => file.read(cx, op).await?,
+                None => cx.reply_err(libc::ENOENT).await?,
+            },
+
+            _ => (),
         }
-    }
-}
 
-impl Node for RootNode {
-    fn get_attr(&self) -> FileAttr {
-        self.attr.load()
-    }
-
-    fn set_attr(&self, attr: FileAttr) {
-        self.attr.store(attr)
+        Ok(())
     }
 }
 
 // ==== FileNode ====
 
+#[derive(Debug)]
 struct GistFileNode {
-    attr: AtomicCell<FileAttr>,
-    content: Vec<u8>,
+    node: Node,
+    filename: String,
+    content: Mutex<Vec<u8>>,
 }
 
-#[polyfuse::async_trait]
-impl Node for GistFileNode {
-    fn get_attr(&self) -> FileAttr {
-        self.attr.load()
+impl GistFileNode {
+    async fn update_content(&self, size: u64, content: impl Into<Vec<u8>>) {
+        let mut attr = self.node.attr();
+        attr.set_size(size);
+        self.node.set_attr(attr);
+
+        *self.content.lock().await = content.into();
     }
 
-    fn set_attr(&self, attr: FileAttr) {
-        self.attr.store(attr);
-    }
+    async fn read<W: ?Sized>(&self, cx: &mut Context<'_, W>, op: op::Read<'_>) -> io::Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let content = self.content.lock().await;
 
-    async fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-        let offset = offset as usize;
-        if offset > self.content.len() {
-            return Ok(0);
+        let offset = op.offset() as usize;
+        if offset > content.len() {
+            return op.reply(cx, &[]).await;
         }
 
-        let content = &self.content[offset..];
-        let len = std::cmp::min(content.len(), buf.len());
-        buf[..len].copy_from_slice(&content[..len]);
+        let content = &content[offset..];
+        let len = std::cmp::min(content.len(), op.size() as usize);
+        op.reply(cx, &content[..len]).await?;
 
-        Ok(len)
+        Ok(())
     }
 }
