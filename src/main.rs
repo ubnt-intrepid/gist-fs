@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenv::dotenv().ok();
+
     tracing_subscriber::fmt::init();
 
     let mut args = Arguments::from_env();
@@ -21,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
     fs.fetch_gist().await?;
 
     polyfuse_tokio::mount(
-        fs,//
+        fs, //
         mountpoint,
         &["-o".as_ref(), "fsname=gistfs".as_ref()],
     )

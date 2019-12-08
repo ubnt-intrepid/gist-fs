@@ -1,5 +1,5 @@
 use crate::{
-    gist::GistClient,
+    gist::{Gist, GistClient},
     node::{Node, NodeTable},
 };
 use futures::{io::AsyncWrite, lock::Mutex};
@@ -13,91 +13,34 @@ use std::{collections::HashMap, io, sync::Arc};
 pub struct GistFs {
     client: GistClient,
     node_table: NodeTable,
-    files: Mutex<HashMap<u64, Arc<GistFileNode>>>,
+    files: GistFiles,
 }
 
 impl GistFs {
     pub fn new(client: GistClient) -> Self {
-        let root_attr = {
-            let mut attr = FileAttr::default();
-            attr.set_mode(libc::S_IFDIR | 0o555);
-            attr.set_uid(unsafe { libc::getuid() });
-            attr.set_gid(unsafe { libc::getgid() });
-            attr.set_nlink(2);
-            attr
-        };
-
-        let node_table = NodeTable::new(root_attr);
+        let node_table = NodeTable::new({
+            let mut root_attr = FileAttr::default();
+            root_attr.set_mode(libc::S_IFDIR | 0o555);
+            root_attr.set_uid(unsafe { libc::getuid() });
+            root_attr.set_gid(unsafe { libc::getgid() });
+            root_attr.set_nlink(2);
+            root_attr
+        });
 
         Self {
             client,
             node_table,
-            files: Mutex::default(),
+            files: GistFiles::default(),
         }
     }
 
     // TODO:
     // * invalidate the old files
     pub async fn fetch_gist(&self) -> anyhow::Result<()> {
-        tracing::debug!("fetch the gist content");
+        tracing::debug!("fetch Gist content");
         let gist = self.client.fetch().await?;
-
-        let old_files = {
-            let mut files = self.files.lock().await;
-
-            let mut new_files = HashMap::with_capacity(files.len());
-            for (filename, gist_file) in gist.files {
-                let ino = files
-                    .iter()
-                    .find(|(_, file)| file.filename == filename)
-                    .map(|(ino, _)| *ino);
-                match ino {
-                    Some(ino) => {
-                        tracing::debug!("update an exist file: filename={:?}", gist_file.filename);
-                        let file = files.remove(&ino).unwrap();
-                        file.update_content(gist_file.size, gist_file.content).await;
-                        new_files.insert(ino, file);
-                    }
-                    None => {
-                        tracing::debug!("new file: filename={:?}", gist_file.filename);
-                        let mut attr = FileAttr::default();
-                        attr.set_nlink(1);
-                        attr.set_mode(libc::S_IFREG | 0o444);
-                        attr.set_size(gist_file.size as u64);
-                        attr.set_uid(unsafe { libc::getuid() });
-                        attr.set_gid(unsafe { libc::getgid() });
-
-                        let node = self
-                            .node_table
-                            .new_node(1, filename.clone().into(), attr)
-                            .await
-                            .map_err(std::io::Error::from_raw_os_error)?;
-
-                        new_files.insert(
-                            node.attr().ino(),
-                            Arc::new(GistFileNode {
-                                node,
-                                filename,
-                                content: Mutex::new(gist_file.content.into()),
-                            }),
-                        );
-                    }
-                }
-            }
-            std::mem::replace(&mut *files, new_files)
-        };
-
-        for (ino, file) in old_files {
-            tracing::debug!("remove a file: ino={}, filename={:?}", ino, file.filename);
-            self.node_table.remove_node(ino).await;
-        }
-
+        self.files.update(gist, &self.node_table).await?;
         Ok(())
-    }
-
-    async fn get_file(&self, ino: u64) -> Option<Arc<GistFileNode>> {
-        let files = self.files.lock().await;
-        files.get(&ino).cloned()
     }
 }
 
@@ -132,12 +75,78 @@ impl<T> Filesystem<T> for GistFs {
 
             Operation::Readdir(op) => self.node_table.reply_readdir(cx, op).await?,
 
-            Operation::Read(op) => match self.get_file(op.ino()).await {
+            Operation::Read(op) => match self.files.get(op.ino()).await {
                 Some(file) => file.read(cx, op).await?,
                 None => cx.reply_err(libc::ENOENT).await?,
             },
 
             _ => (),
+        }
+
+        Ok(())
+    }
+}
+
+// ==== Files ====
+
+#[derive(Default)]
+struct GistFiles(Mutex<HashMap<u64, Arc<GistFileNode>>>);
+
+impl GistFiles {
+    async fn get(&self, ino: u64) -> Option<Arc<GistFileNode>> {
+        let files = self.0.lock().await;
+        files.get(&ino).cloned()
+    }
+
+    async fn update(&self, gist: Gist, node_table: &NodeTable) -> anyhow::Result<()> {
+        let old_files = {
+            let mut files = self.0.lock().await;
+
+            let mut new_files = HashMap::with_capacity(files.len());
+            for (filename, gist_file) in gist.files {
+                let ino = files
+                    .iter()
+                    .find(|(_, file)| file.filename == filename)
+                    .map(|(ino, _)| *ino);
+                match ino {
+                    Some(ino) => {
+                        tracing::debug!("update an exist file: filename={:?}", gist_file.filename);
+                        let file = files.remove(&ino).unwrap();
+                        file.update_content(gist_file.size, gist_file.content).await;
+                        new_files.insert(ino, file);
+                    }
+                    None => {
+                        tracing::debug!("new file: filename={:?}", gist_file.filename);
+                        let mut attr = FileAttr::default();
+                        attr.set_nlink(1);
+                        attr.set_mode(libc::S_IFREG | 0o444);
+                        attr.set_size(gist_file.size as u64);
+                        attr.set_uid(unsafe { libc::getuid() });
+                        attr.set_gid(unsafe { libc::getgid() });
+
+                        let node = node_table
+                            .new_node(1, filename.clone().into(), attr)
+                            .await
+                            .map_err(std::io::Error::from_raw_os_error)?;
+
+                        new_files.insert(
+                            node.attr().ino(),
+                            Arc::new(GistFileNode {
+                                node,
+                                filename,
+                                content: Mutex::new(gist_file.content.into()),
+                            }),
+                        );
+                    }
+                }
+            }
+
+            std::mem::replace(&mut *files, new_files)
+        };
+
+        for (ino, file) in old_files {
+            tracing::debug!("remove a file: ino={}, filename={:?}", ino, file.filename);
+            node_table.remove_node(ino).await;
         }
 
         Ok(())

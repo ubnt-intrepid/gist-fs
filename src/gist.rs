@@ -22,7 +22,10 @@ impl GistClient {
             let url = format!("https://api.github.com/gists/{id}", id = self.id);
             let mut request = Request::get(url);
             if let Some(ref token) = self.token {
-                request.header("authentication", format!("token {token}", token = token));
+                request.header(
+                    http::header::AUTHORIZATION,
+                    format!("token {token}", token = token),
+                );
             }
             request.body(())?.send_async().await?
         };
