@@ -64,7 +64,7 @@ impl<T> Filesystem<T> for GistFs {
 
             Operation::Forget(forgets) => self.node_table.forget(forgets).await,
 
-            Operation::Getattr(op) => match self.node_table.get_node(op.ino()).await {
+            Operation::Getattr(op) => match self.node_table.get(op.ino()).await {
                 Some(node) => {
                     let mut reply = ReplyAttr::new(node.attr());
                     reply.attr_valid(0, 0);
@@ -73,7 +73,7 @@ impl<T> Filesystem<T> for GistFs {
                 None => cx.reply_err(libc::ENOENT).await?,
             },
 
-            Operation::Readdir(op) => self.node_table.reply_readdir(cx, op).await?,
+            Operation::Readdir(op) => self.node_table.root().readdir(cx, op).await?,
 
             Operation::Read(op) => match self.files.get(op.ino()).await {
                 Some(file) => file.read(cx, op).await?,
@@ -125,7 +125,8 @@ impl GistFiles {
                         attr.set_gid(unsafe { libc::getgid() });
 
                         let node = node_table
-                            .new_node(1, filename.clone().into(), attr)
+                            .root()
+                            .new_child(filename.clone().into(), attr)
                             .await
                             .map_err(std::io::Error::from_raw_os_error)?;
 
@@ -146,7 +147,7 @@ impl GistFiles {
 
         for (ino, file) in old_files {
             tracing::debug!("remove a file: ino={}, filename={:?}", ino, file.filename);
-            node_table.remove_node(ino).await;
+            file.node.remove().await;
         }
 
         Ok(())
