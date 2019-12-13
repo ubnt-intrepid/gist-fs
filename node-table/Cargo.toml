@@ -1,0 +1,13 @@
+[package]
+name = "node-table"
+version = "0.1.0"
+publish = false
+authors = ["Yusuke Sasaki <yusuke.sasaki.nuem@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+futures = "0.3"
+crossbeam = "0.7"
+indexmap = "1"
+polyfuse = "0.2"
+libc = "0.2"

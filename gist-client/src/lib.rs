@@ -1,3 +1,5 @@
+//! Gist client.
+
 use chrono::{DateTime, Utc};
 use http::{Request, StatusCode};
 use isahc::RequestExt;
@@ -13,8 +15,12 @@ pub struct GistClient {
 }
 
 impl GistClient {
-    pub fn new(id: String, token: Option<String>) -> Self {
-        Self { id, token }
+    pub fn new(id: String) -> Self {
+        Self { id, token: None }
+    }
+
+    pub fn set_token(&mut self, token: String) {
+        self.token.replace(token);
     }
 
     pub async fn fetch(&self) -> anyhow::Result<Gist> {

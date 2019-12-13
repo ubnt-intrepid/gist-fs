@@ -1,3 +1,5 @@
+//! In-memory node table.
+
 use crossbeam::atomic::AtomicCell;
 use futures::{io::AsyncWrite, lock::Mutex};
 use indexmap::map::{Entry as MapEntry, IndexMap};
@@ -162,29 +164,30 @@ impl Node {
     pub async fn new_child(&self, name: OsString, attr: FileAttr) -> Result<Node, i32> {
         let global = self.global.upgrade().expect("the node table is died");
         let parent = self.inner.upgrade().expect("the node is died");
+
+        let mut attr = attr;
+        let ino = global.next_ino.load();
+        attr.set_ino(ino);
+
+        let kind = match attr.mode() & libc::S_IFMT {
+            libc::S_IFDIR => NodeKind::Dir(Mutex::new(DirNode {
+                children: IndexMap::new(),
+                dirents: [
+                    DirEntry::dir(".", ino, 1),
+                    DirEntry::dir("..", parent.nodeid, 2),
+                ],
+            })),
+            libc::S_IFREG => NodeKind::File,
+            _ => return Err(libc::ENOTSUP),
+        };
+
         match parent.kind {
             NodeKind::Dir(ref dir) => {
                 let mut dir = dir.lock().await;
                 match dir.children.entry(name) {
                     MapEntry::Occupied(..) => Err(libc::EEXIST),
                     MapEntry::Vacant(entry) => {
-                        let mut attr = attr;
-
-                        let ino = global.next_ino.fetch_add(1);
-                        attr.set_ino(ino);
-
-                        let kind = match attr.mode() & libc::S_IFMT {
-                            libc::S_IFDIR => NodeKind::Dir(Mutex::new(DirNode {
-                                children: IndexMap::new(),
-                                dirents: [
-                                    DirEntry::dir(".", ino, 1),
-                                    DirEntry::dir("..", parent.nodeid, 2),
-                                ],
-                            })),
-                            libc::S_IFREG => NodeKind::File,
-                            _ => return Err(libc::ENOTSUP),
-                        };
-
+                        global.next_ino.fetch_add(1);
                         let inner = Arc::new(NodeInner {
                             nodeid: ino,
                             attr: AtomicCell::new(attr),

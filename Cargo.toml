@@ -7,23 +7,20 @@ edition = "2018"
 
 [dependencies]
 anyhow = "1"
-chrono = { version = "0.4", features = [ "serde" ] }
 crossbeam = "0.7"
 dotenv = "0.15"
 futures = "0.3"
-http = "0.1"
 indexmap = "1"
-isahc = "0.8" # FIXME: switch to surf
 libc = "0.2"
-mime = "0.3"
 pico-args = "0.3"
 polyfuse = "0.2"
 polyfuse-tokio = "0.1"
-serde = { version = "1", features = [ "derive" ] }
-serde_json = "1"
 tokio = { version = "0.2", features = [ "full" ] }
 tracing = "0.1"
 tracing-subscriber = "0.1"
+
+gist-client = { path = "gist-client" }
+node-table = { path = "node-table" }
 
 [lib]
 name = "gist_fs"
@@ -33,3 +30,10 @@ path = "src/lib.rs"
 name = "gist-fs"
 path = "src/main.rs"
 doc = false
+
+[workspace]
+members = [
+  ".",
+  "gist-client",
+  "node-table",
+]
