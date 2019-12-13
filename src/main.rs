@@ -1,4 +1,4 @@
-use gist_client::GistClient;
+use gist_client::Client;
 use gist_fs::GistFs;
 use pico_args::Arguments;
 use std::path::PathBuf;
@@ -11,17 +11,16 @@ async fn main() -> anyhow::Result<()> {
     let mut args = Arguments::from_env();
 
     let gist_id = args.value_from_str("--gist-id")?;
-    let mut client = GistClient::new(gist_id);
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        client.set_token(token);
-    }
 
     let mountpoint: PathBuf = args
         .free_from_str()?
         .ok_or_else(|| anyhow::anyhow!("missing mountpoint"))?;
     anyhow::ensure!(mountpoint.is_dir(), "the mountpoint must be a directory");
 
-    let fs = GistFs::new(client);
+    let token = std::env::var("GITHUB_TOKEN").ok();
+    let client = Client::new(token);
+
+    let fs = GistFs::new(client, gist_id);
     fs.fetch_gist().await?;
 
     polyfuse_tokio::mount(

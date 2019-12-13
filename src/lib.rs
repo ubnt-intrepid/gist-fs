@@ -3,23 +3,24 @@
 #![allow(dead_code)]
 
 use futures::{io::AsyncWrite, lock::Mutex};
-use gist_client::{Gist, GistClient};
+use gist_client::{Client, ETag, Gist};
 use node_table::{Node, NodeTable};
 use polyfuse::{
     op,
-    reply::{ReplyAttr, ReplyEntry},
+    reply::{ReplyAttr, ReplyEntry, ReplyOpendir},
     Context, FileAttr, Filesystem, Operation,
 };
 use std::{collections::HashMap, io, sync::Arc};
 
 pub struct GistFs {
-    client: GistClient,
+    client: Client,
+    gist_id: String,
     node_table: NodeTable,
     files: GistFiles,
 }
 
 impl GistFs {
-    pub fn new(client: GistClient) -> Self {
+    pub fn new(client: Client, gist_id: String) -> Self {
         let node_table = NodeTable::new({
             let mut root_attr = FileAttr::default();
             root_attr.set_mode(libc::S_IFDIR | 0o555);
@@ -31,6 +32,7 @@ impl GistFs {
 
         Self {
             client,
+            gist_id,
             node_table,
             files: GistFiles::default(),
         }
@@ -40,14 +42,23 @@ impl GistFs {
     // * invalidate the old files
     pub async fn fetch_gist(&self) -> anyhow::Result<()> {
         tracing::debug!("fetch Gist content");
-        let gist = self.client.fetch().await?;
-        self.files.update(gist, &self.node_table).await?;
+        let etag = self.files.etag.lock().await.clone();
+        let response = self.client.fetch_gist(&self.gist_id, etag.as_ref()).await?;
+
+        if let Some((gist, etag)) = response {
+            tracing::debug!("update Gist content: gist={:?}, etag={:?}", gist, etag);
+            self.files.update(gist, etag, &self.node_table).await?;
+        } else {
+            tracing::debug!("use cached Gist content");
+        }
+
         Ok(())
     }
 }
 
 #[polyfuse::async_trait]
 impl<T> Filesystem<T> for GistFs {
+    #[allow(clippy::cognitive_complexity)]
     async fn call<W: ?Sized>(&self, cx: &mut Context<'_, W>, op: Operation<'_, T>) -> io::Result<()>
     where
         T: Send + 'async_trait,
@@ -75,6 +86,21 @@ impl<T> Filesystem<T> for GistFs {
                 None => cx.reply_err(libc::ENOENT).await?,
             },
 
+            Operation::Opendir(op) => match op.ino() {
+                1 => match self.fetch_gist().await {
+                    Ok(()) => {
+                        let mut reply = ReplyOpendir::new(0);
+                        reply.cache_dir(false);
+                        op.reply(cx, reply).await?;
+                    }
+                    Err(err) => {
+                        tracing::error!("fetch failed: {}", err);
+                        cx.reply_err(libc::EIO).await?;
+                    }
+                },
+                _ => cx.reply_err(libc::ENOTDIR).await?,
+            },
+
             Operation::Readdir(op) => self.node_table.root().readdir(cx, op).await?,
 
             Operation::Read(op) => match self.files.get(op.ino()).await {
@@ -92,17 +118,25 @@ impl<T> Filesystem<T> for GistFs {
 // ==== Files ====
 
 #[derive(Default)]
-struct GistFiles(Mutex<HashMap<u64, Arc<GistFileNode>>>);
+struct GistFiles {
+    etag: Mutex<Option<ETag>>,
+    files: Mutex<HashMap<u64, Arc<GistFileNode>>>,
+}
 
 impl GistFiles {
     async fn get(&self, ino: u64) -> Option<Arc<GistFileNode>> {
-        let files = self.0.lock().await;
+        let files = self.files.lock().await;
         files.get(&ino).cloned()
     }
 
-    async fn update(&self, gist: Gist, node_table: &NodeTable) -> anyhow::Result<()> {
+    async fn update(
+        &self,
+        gist: Gist,
+        etag: Option<ETag>,
+        node_table: &NodeTable,
+    ) -> anyhow::Result<()> {
         let old_files = {
-            let mut files = self.0.lock().await;
+            let mut files = self.files.lock().await;
 
             let mut new_files = HashMap::with_capacity(files.len());
             for (filename, gist_file) in gist.files {
@@ -150,6 +184,10 @@ impl GistFiles {
         for (ino, file) in old_files {
             tracing::debug!("remove a file: ino={}, filename={:?}", ino, file.filename);
             file.node.remove().await;
+        }
+
+        if let Some(etag) = etag {
+            self.etag.lock().await.replace(etag);
         }
 
         Ok(())
