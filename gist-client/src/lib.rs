@@ -8,16 +8,23 @@ use http::{
 use isahc::RequestExt;
 use mime::Mime;
 use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt};
 
 /// The entity tag to specify the revision of Gist content.
 #[derive(Debug, Clone)]
 pub struct ETag(HeaderValue);
 
 /// Gist client.
-#[derive(Debug)]
 pub struct Client {
     token: Option<String>,
+}
+
+impl fmt::Debug for Client {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Client")
+            .field("token", &self.token.as_ref().map(|_| "<token>"))
+            .finish()
+    }
 }
 
 impl Client {

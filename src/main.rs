@@ -20,8 +20,8 @@ async fn main() -> anyhow::Result<()> {
     let token = std::env::var("GITHUB_TOKEN").ok();
     let client = Client::new(token);
 
-    let fs = GistFs::new(client, gist_id);
-    fs.fetch_gist().await?;
+    let fs = GistFs::new(client, gist_id).await?;
+    tracing::trace!("fs={:?}", fs);
 
     polyfuse_tokio::mount(
         fs, //
