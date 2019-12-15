@@ -1,5 +1,4 @@
-use gist_client::Client;
-use gist_fs::GistFs;
+use gist_fs::{client::Client, fs::GistFs};
 use pico_args::Arguments;
 use std::path::PathBuf;
 
