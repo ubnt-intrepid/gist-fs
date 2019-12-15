@@ -5,6 +5,7 @@ use polyfuse::{op, reply, Context, DirEntry, FileAttr, Filesystem, Operation};
 use std::{collections::HashMap, io, os::unix::ffi::OsStrExt};
 
 const ROOT_INO: u64 = 1;
+const FILE_INO_OFFSET: u64 = 128;
 
 #[derive(Debug)]
 pub struct GistFs {
@@ -49,8 +50,8 @@ impl GistFs {
         root_attr.set_mtime(mtime.timestamp() as u64, mtime.timestamp_subsec_nanos());
 
         let mut files = HashMap::new();
-        let mut next_ino = 2;
 
+        let mut next_ino = FILE_INO_OFFSET;
         for file in gist.files.values() {
             let mut attr = FileAttr::default();
             attr.set_ino(next_ino);
@@ -131,7 +132,6 @@ impl GistFs {
 
                 let ctime = gist.created_at;
                 let mtime = gist.updated_at;
-                let now = Utc::now();
 
                 for (filename, file) in &gist.files {
                     match state
