@@ -135,6 +135,7 @@ impl GistFs {
 
                 let ctime = gist.created_at;
                 let mtime = gist.updated_at;
+                let now = Utc::now();
 
                 for (filename, file) in &gist.files {
                     match state
@@ -334,30 +335,6 @@ impl GistFs {
             }
         }
     }
-
-    async fn do_flush<W: ?Sized>(
-        &self,
-        cx: &mut Context<'_, W>,
-        op: op::Flush<'_>,
-    ) -> io::Result<()>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        match op.ino() {
-            ROOT_INO => cx.reply_err(libc::EISDIR).await,
-            ino => {
-                let mut state = self.state.lock().await;
-                match state.files.get_mut(&ino) {
-                    Some(_file) => {
-                        // TODO
-                        tracing::trace!("send modification to GitHub");
-                        op.reply(cx).await
-                    }
-                    None => cx.reply_err(libc::ENOENT).await,
-                }
-            }
-        }
-    }
 }
 
 #[polyfuse::async_trait]
@@ -379,7 +356,6 @@ where
             Operation::Open(op) => self.do_open(cx, op).await,
             Operation::Read(op) => self.do_read(cx, op).await,
             Operation::Write(op, data) => self.do_write(cx, op, data).await,
-            Operation::Flush(op) => self.do_flush(cx, op).await,
             _ => Ok(()),
         }
     }
