@@ -16,25 +16,17 @@ pub struct GistFs {
     gist_id: String,
     cache_period: Duration,
     root_attr: FileAttr,
+    entries: Vec<DirEntry>,
     state: Mutex<GistFsState>,
 }
 
 #[derive(Debug)]
 struct GistFsState {
     files: HashMap<u64, GistFile>,
-    entries: Vec<DirEntry>,
 
     gist: Gist,
     etag: Option<ETag>,
     expired: DateTime<Utc>,
-}
-
-#[derive(Debug)]
-struct GistFile {
-    attr: FileAttr,
-    filename: String,
-    raw_url: String,
-    content: Option<Vec<u8>>,
 }
 
 impl GistFs {
@@ -105,9 +97,9 @@ impl GistFs {
             gist_id,
             cache_period,
             root_attr,
+            entries,
             state: Mutex::new(GistFsState {
                 files,
-                entries,
                 gist,
                 etag,
                 expired,
@@ -242,29 +234,7 @@ impl GistFs {
             ino => {
                 let mut state = self.state.lock().await;
                 match state.files.get_mut(&ino) {
-                    Some(file) => {
-                        if let Some((sec, nsec, is_now)) = op.mtime() {
-                            // utimens
-                            if is_now {
-                                let now = Utc::now();
-                                file.attr.set_mtime(
-                                    now.timestamp() as u64,
-                                    now.timestamp_subsec_nanos(),
-                                );
-                            } else {
-                                file.attr.set_mtime(sec, nsec);
-                            };
-                        }
-
-                        if let Some(size) = op.size() {
-                            // truncate
-                            file.attr.set_size(size);
-                            if let Some(ref mut content) = file.content {
-                                content.resize(size as usize, 0);
-                            }
-                        }
-                        file.attr
-                    }
+                    Some(file) => file.set_attr(&op),
                     None => return cx.reply_err(libc::ENOENT).await,
                 }
             }
@@ -296,10 +266,8 @@ impl GistFs {
     where
         W: AsyncWrite + Unpin,
     {
-        let state = self.state.lock().await;
-
         let mut total_len = 0;
-        let entries: Vec<&[u8]> = state
+        let entries: Vec<&[u8]> = self
             .entries
             .iter()
             .skip(op.offset() as usize)
@@ -318,23 +286,15 @@ impl GistFs {
         W: AsyncWrite + Unpin,
     {
         match op.ino() {
-            ROOT_INO => return cx.reply_err(libc::EISDIR).await,
+            ROOT_INO => cx.reply_err(libc::EISDIR).await,
             ino => {
                 let mut state = self.state.lock().await;
                 match state.files.get_mut(&ino) {
-                    Some(file) => {
-                        // TODO: fetch content.
-                        file.content.get_or_insert_with(|| {
-                            tracing::warn!("the content of Gist file is truncated.");
-                            Vec::new()
-                        });
-                    }
-                    None => return cx.reply_err(libc::ENOENT).await,
+                    Some(file) => file.open(cx, op).await,
+                    None => cx.reply_err(libc::ENOENT).await,
                 }
             }
-        };
-
-        op.reply(cx, reply::ReplyOpen::new(0)).await
+        }
     }
 
     async fn do_read<W: ?Sized>(&self, cx: &mut Context<'_, W>, op: op::Read<'_>) -> io::Result<()>
@@ -346,20 +306,7 @@ impl GistFs {
             ino => {
                 let state = self.state.lock().await;
                 match state.files.get(&ino) {
-                    Some(file) => {
-                        let content = file
-                            .content
-                            .as_ref()
-                            .expect("the Gist content is not prepared");
-                        let offset = op.offset() as usize;
-                        if offset > content.len() {
-                            return op.reply(cx, &[]).await;
-                        }
-
-                        let content = &content[offset..];
-                        let content = &content[..std::cmp::min(content.len(), op.size() as usize)];
-                        op.reply(cx, content).await
-                    }
+                    Some(file) => file.read(cx, op).await,
                     None => cx.reply_err(libc::ENOENT).await,
                 }
             }
@@ -381,22 +328,7 @@ impl GistFs {
             ino => {
                 let mut state = self.state.lock().await;
                 match state.files.get_mut(&ino) {
-                    Some(file) => {
-                        let content = file
-                            .content
-                            .as_mut()
-                            .expect("The gist content is not prepared");
-                        let offset = op.offset() as usize;
-                        let size = op.size() as usize;
-                        content.resize(offset + size, 0);
-
-                        content[offset..size].copy_from_slice(data.as_ref());
-
-                        file.attr.set_size(content.len() as u64);
-
-                        let size = op.size();
-                        op.reply(cx, reply::ReplyWrite::new(size)).await
-                    }
+                    Some(file) => file.write(cx, op, data).await,
                     None => cx.reply_err(libc::ENOENT).await,
                 }
             }
@@ -450,5 +382,97 @@ where
             Operation::Flush(op) => self.do_flush(cx, op).await,
             _ => Ok(()),
         }
+    }
+}
+
+#[derive(Debug)]
+struct GistFile {
+    attr: FileAttr,
+    filename: String,
+    raw_url: String,
+    content: Option<Vec<u8>>,
+}
+
+impl GistFile {
+    fn set_attr(&mut self, op: &op::Setattr<'_>) -> FileAttr {
+        // utimens
+        if let Some((sec, nsec, is_now)) = op.mtime() {
+            if is_now {
+                let now = Utc::now();
+                self.attr
+                    .set_mtime(now.timestamp() as u64, now.timestamp_subsec_nanos());
+            } else {
+                self.attr.set_mtime(sec, nsec);
+            };
+        }
+
+        // truncate
+        if let Some(size) = op.size() {
+            self.attr.set_size(size);
+            if let Some(ref mut content) = self.content {
+                content.resize(size as usize, 0);
+            }
+        }
+
+        self.attr
+    }
+
+    async fn open<W: ?Sized>(&mut self, cx: &mut Context<'_, W>, op: op::Open<'_>) -> io::Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        // TODO: fetch content.
+        self.content.get_or_insert_with(|| {
+            tracing::warn!("the content of Gist file is truncated.");
+            Vec::new()
+        });
+
+        op.reply(cx, reply::ReplyOpen::new(0)).await
+    }
+
+    async fn read<W: ?Sized>(&self, cx: &mut Context<'_, W>, op: op::Read<'_>) -> io::Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let content = self
+            .content
+            .as_ref()
+            .expect("the Gist content is not prepared");
+
+        let offset = op.offset() as usize;
+        if offset > content.len() {
+            return op.reply(cx, &[]).await;
+        }
+
+        let content = &content[offset..];
+        let content = &content[..std::cmp::min(content.len(), op.size() as usize)];
+
+        op.reply(cx, content).await
+    }
+
+    async fn write<W: ?Sized, T>(
+        &mut self,
+        cx: &mut Context<'_, W>,
+        op: op::Write<'_>,
+        data: T,
+    ) -> io::Result<()>
+    where
+        W: AsyncWrite + Unpin,
+        T: AsRef<[u8]>,
+    {
+        let content = self
+            .content
+            .as_mut()
+            .expect("The gist content is not prepared");
+        let offset = op.offset() as usize;
+        let size = op.size() as usize;
+        content.resize(offset + size, 0);
+
+        content[offset..size].copy_from_slice(data.as_ref());
+
+        self.attr.set_size(content.len() as u64);
+
+        let size = op.size();
+        op.reply(cx, reply::ReplyWrite::new(size)).await
     }
 }
